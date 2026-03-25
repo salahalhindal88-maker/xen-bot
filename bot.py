@@ -100,19 +100,17 @@ PLATFORM_EMOJI = {
 def get_ydl_opts(platform: str, quality: str, output_path: str) -> dict:
     base = {"outtmpl": output_path, "quiet": True, "no_warnings": True,
             "noplaylist": True, "socket_timeout": 30}
-    if quality == "audio":
-        return {**base, "format": "bestaudio/best",
-                "postprocessors": [{"key": "FFmpegExtractAudio",
-                                    "preferredcodec": "mp3", "preferredquality": "192"}]}
+
+    # بدون ffmpeg — نحمل ملف واحد جاهز فيه فيديو وصوت معاً
     fmt = {
-        "high":   "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "medium": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "low":    "bestvideo[height<=480]+bestaudio/best[height<=480]",
-    }.get(quality, "bestvideo[height<=720]+bestaudio/best[height<=720]")
+        "high":   "best[height<=1080][ext=mp4]/best[ext=mp4]/best",
+        "medium": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
+        "low":    "best[height<=480][ext=mp4]/best[ext=mp4]/best",
+        "audio":  "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+    }.get(quality, "best[ext=mp4]/best")
+
     if platform == "tiktok":
         return {**base, "format": fmt, "http_headers": {"User-Agent": "Mozilla/5.0"}}
-    elif platform == "youtube":
-        return {**base, "format": fmt, "merge_output_format": "mp4"}
     return {**base, "format": fmt}
 
 async def download_media(url: str, platform: str, quality: str) -> dict:
