@@ -1,5 +1,5 @@
 """
-بوت تيليجرام لتحميل الميديا + نظام إعلانات
+بوت تيليجرام لتحميل الميديا + نظام إعلانات إجباري
 """
 
 import logging
@@ -17,9 +17,10 @@ from telegram.ext import (
 )
 import yt_dlp
 
-BOT_TOKEN   = "8243416431:AAG5eZHOLB3vSgC_V2lLlQMdjkF-4oE7M_s"
-MONETAG_URL = "https://www.profitablecpmratenetwork.com/u8gmpfy20?key=8c14ee6a74908a6a9a9a8d4358ab80bf"
-AD_WAIT_SECS     = 15
+BOT_TOKEN        = "8243416431:AAG5eZHOLB3vSgC_V2lLlQMdjkF-4oE7M_s"
+MONETAG_URL      = "https://www.profitablecpmratenetwork.com/u8gmpfy20?key=8c14ee6a74908a6a9a9a8d4358ab80bf"
+AD_FORCE_WAIT    = 30       # ثواني انتظار إجباري بعد الضغط على الإعلان
+AD_COOLDOWN      = 60 * 60  # ساعة وصول مجاني بعد مشاهدة الإعلان
 MAX_FILE_SIZE_MB = 50
 DOWNLOAD_DIR     = "downloads"
 
@@ -27,15 +28,37 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# ─────────────────────────────────────────────
+# نظام التحقق الإجباري
+# ad_watched  = user_id → وقت منح الوصول (بعد انتهاء الانتظار)
+# ad_clicked  = user_id → وقت ضغط زر الإعلان
+# ─────────────────────────────────────────────
 ad_watched: dict = {}
-AD_COOLDOWN = 60 * 60
+ad_clicked: dict = {}
 
 def user_has_access(user_id: int) -> bool:
     last = ad_watched.get(user_id, 0)
     return (time.time() - last) < AD_COOLDOWN
 
+def record_ad_click(user_id: int):
+    """تسجيل لحظة ضغط زر الإعلان"""
+    ad_clicked[user_id] = time.time()
+
+def user_waited_enough(user_id: int) -> bool:
+    """هل انتظر المستخدم الوقت الكافي؟"""
+    clicked = ad_clicked.get(user_id, 0)
+    return clicked > 0 and (time.time() - clicked) >= AD_FORCE_WAIT
+
+def seconds_remaining(user_id: int) -> int:
+    clicked = ad_clicked.get(user_id, 0)
+    if clicked == 0:
+        return AD_FORCE_WAIT
+    remaining = AD_FORCE_WAIT - (time.time() - clicked)
+    return max(0, int(remaining))
+
 def grant_access(user_id: int):
     ad_watched[user_id] = time.time()
+    ad_clicked.pop(user_id, None)
 
 def time_left(user_id: int) -> str:
     last = ad_watched.get(user_id, 0)
@@ -43,6 +66,9 @@ def time_left(user_id: int) -> str:
     mins = int(remaining // 60)
     return f"{mins} دقيقة"
 
+# ─────────────────────────────────────────────
+# المنصات
+# ─────────────────────────────────────────────
 def detect_platform(url: str) -> str:
     url = url.lower()
     if any(x in url for x in ["youtube.com", "youtu.be"]): return "youtube"
@@ -68,6 +94,9 @@ PLATFORM_EMOJI = {
     "facebook": "📘 فيسبوك", "unknown": "🔗 رابط",
 }
 
+# ─────────────────────────────────────────────
+# التحميل
+# ─────────────────────────────────────────────
 def get_ydl_opts(platform: str, quality: str, output_path: str) -> dict:
     base = {"outtmpl": output_path, "quiet": True, "no_warnings": True,
             "noplaylist": True, "socket_timeout": 30}
@@ -80,9 +109,7 @@ def get_ydl_opts(platform: str, quality: str, output_path: str) -> dict:
         "medium": "bestvideo[height<=720]+bestaudio/best[height<=720]",
         "low":    "bestvideo[height<=480]+bestaudio/best[height<=480]",
     }.get(quality, "bestvideo[height<=720]+bestaudio/best[height<=720]")
-    if platform in ("twitter", "instagram"):
-        return {**base, "format": fmt}
-    elif platform == "tiktok":
+    if platform == "tiktok":
         return {**base, "format": fmt, "http_headers": {"User-Agent": "Mozilla/5.0"}}
     elif platform == "youtube":
         return {**base, "format": fmt, "merge_output_format": "mp4"}
@@ -113,7 +140,6 @@ async def download_media(url: str, platform: str, quality: str) -> dict:
         if "private" in err.lower(): return {"success": False, "error": "المنشور خاص"}
         return {"success": False, "error": f"فشل التحميل: {err[:100]}"}
     except Exception as e:
-        logger.error(f"خطا: {e}")
         return {"success": False, "error": "حدث خطا، حاول مرة اخرى"}
 
 def quality_keyboard():
@@ -124,6 +150,9 @@ def quality_keyboard():
          InlineKeyboardButton("🎵 صوت MP3", callback_data="quality_audio")],
     ])
 
+# ─────────────────────────────────────────────
+# الأوامر
+# ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "اهلا! انا بوت تحميل الميديا\n\n"
@@ -136,17 +165,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
+
     if not is_valid_url(text):
         await update.message.reply_text("ارسل رابطا صحيحا")
         return
+
     url = extract_url(text)
     platform = detect_platform(url)
+
     if platform == "unknown":
         await update.message.reply_text("المنصة غير مدعومة")
         return
+
     context.user_data["url"] = url
     context.user_data["platform"] = platform
     platform_name = PLATFORM_EMOJI.get(platform, "رابط")
+
+    # عنده وصول؟ مباشرة للجودة
     if user_has_access(user_id):
         await update.message.reply_text(
             f"رابط {platform_name} جاهز!\n"
@@ -155,59 +190,129 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=quality_keyboard()
         )
     else:
-        keyboard = [
-            [InlineKeyboardButton("👉 مشاهدة الاعلان", url=MONETAG_URL)],
-            [InlineKeyboardButton("✅ شاهدت الاعلان - متابعة", callback_data="ad_done")],
-            [InlineKeyboardButton("⏭ تخطي", callback_data="ad_skip")],
-        ]
+        # يلزمه إعلان - زر واحد فقط الآن
+        keyboard = [[InlineKeyboardButton(
+            f"👉 اضغط هنا لمشاهدة الاعلان ({AD_FORCE_WAIT} ثانية)",
+            callback_data="ad_open"
+        )]]
         await update.message.reply_text(
             f"رابط {platform_name} جاهز!\n\n"
-            f"للمتابعة، شاهد اعلانا قصيرا ({AD_WAIT_SECS} ثانية)\n"
-            "بعد المشاهدة اضغط: شاهدت الاعلان",
+            f"لتحميل المقطع، اضغط الزر وانتظر {AD_FORCE_WAIT} ثانية\n"
+            "ثم سيظهر لك زر التحميل تلقائيا",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
+# ─────────────────────────────────────────────
+# الخطوة 1: ضغط زر الإعلان → فتح الرابط + تسجيل الوقت
+# ─────────────────────────────────────────────
+async def handle_ad_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    # تسجيل وقت الضغط
+    record_ad_click(user_id)
+
+    # تعديل الرسالة - زر الإعلان + زر التأكيد معطل
+    keyboard = [
+        [InlineKeyboardButton("🌐 افتح الاعلان", url=MONETAG_URL)],
+        [InlineKeyboardButton(f"⏳ انتظر {AD_FORCE_WAIT} ثانية...", callback_data="ad_too_early")],
+    ]
+    await query.edit_message_text(
+        f"افتح الاعلان واتركه يشتغل {AD_FORCE_WAIT} ثانية\n\n"
+        f"بعد {AD_FORCE_WAIT} ثانية سيتفعل زر التحميل تلقائيا",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    # انتظر AD_FORCE_WAIT ثانية ثم حدّث الرسالة تلقائياً
+    await asyncio.sleep(AD_FORCE_WAIT)
+
+    # تحقق أن المستخدم لم يحصل على وصول بعد
+    if not user_has_access(user_id) and ad_clicked.get(user_id, 0) > 0:
+        keyboard_done = [[InlineKeyboardButton(
+            "✅ تم! اضغط هنا للتحميل", callback_data="ad_done"
+        )]]
+        try:
+            await query.edit_message_text(
+                "انتهى وقت الاعلان!\n\nاضغط الزر للتحميل:",
+                reply_markup=InlineKeyboardMarkup(keyboard_done)
+            )
+        except Exception:
+            pass
+
+# ─────────────────────────────────────────────
+# الخطوة 2: ضغط زر التأكيد → التحقق من الوقت
+# ─────────────────────────────────────────────
 async def handle_ad_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     await query.answer()
-    if query.data == "ad_skip":
-        await query.edit_message_text("تم التخطي\n\nارسل الرابط مجددا عندما تكون جاهزا")
-        return
-    grant_access(user_id)
-    await query.edit_message_text(
-        "تم فتح التحميل لمدة ساعة كاملة!\n\nاختر الجودة:",
-        reply_markup=quality_keyboard()
-    )
 
+    if query.data == "ad_too_early":
+        secs = seconds_remaining(user_id)
+        if secs > 0:
+            # لم ينتظر بعد
+            await query.answer(
+                f"انتظر {secs} ثانية اخرى!",
+                show_alert=True
+            )
+        return
+
+    if query.data == "ad_done":
+        if not user_waited_enough(user_id):
+            secs = seconds_remaining(user_id)
+            await query.answer(
+                f"لم تنتظر بعد! باقي {secs} ثانية",
+                show_alert=True
+            )
+            return
+
+        # منح الوصول
+        grant_access(user_id)
+        await query.edit_message_text(
+            "تم فتح التحميل لمدة ساعة كاملة!\n\nاختر الجودة:",
+            reply_markup=quality_keyboard()
+        )
+
+# ─────────────────────────────────────────────
+# التحميل بعد اختيار الجودة
+# ─────────────────────────────────────────────
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     await query.answer()
+
     quality = query.data.replace("quality_", "")
     url = context.user_data.get("url")
     platform = context.user_data.get("platform")
+
     if not url:
         await query.edit_message_text("انتهت الجلسة، ارسل الرابط مجددا")
         return
+
     if not user_has_access(user_id):
-        await query.edit_message_text("انتهى وصولك!\n\nارسل الرابط مجددا لمشاهدة اعلان جديد")
+        await query.edit_message_text("انتهى وصولك!\n\nارسل الرابط مجددا")
         return
+
     labels = {"high": "1080p", "medium": "720p", "low": "480p", "audio": "MP3"}
     await query.edit_message_text(
         f"جاري التحميل بجودة {labels.get(quality, '')}...\n"
         f"{PLATFORM_EMOJI.get(platform, '')}\n\nانتظر لحظة..."
     )
+
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None, lambda: asyncio.run(download_media(url, platform, quality))
     )
+
     if not result["success"]:
         await query.edit_message_text(f"فشل التحميل\n\n{result['error']}")
         return
+
     await query.edit_message_text("جاري الارسال...")
     file_path = result["path"]
     caption = f"{result.get('title','')}\n{result.get('size_mb',0)}MB | {PLATFORM_EMOJI.get(platform,'')}"
+
     try:
         with open(file_path, "rb") as f:
             if quality == "audio":
@@ -216,7 +321,9 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.message.reply_photo(photo=f, caption=caption)
             else:
                 await query.message.reply_video(video=f, caption=caption, supports_streaming=True)
-        await query.edit_message_text(f"تم التحميل!\nوصولك المجاني: {time_left(user_id)} متبقية")
+        await query.edit_message_text(
+            f"تم التحميل!\nوصولك المجاني: {time_left(user_id)} متبقية"
+        )
     except Exception as e:
         logger.error(f"خطا ارسال: {e}")
         await query.edit_message_text("فشل الارسال، الملف قد يكون كبيرا جدا")
@@ -228,19 +335,23 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "كيفية الاستخدام:\n\n"
         "1 - ارسل رابط الفيديو\n"
-        "2 - شاهد اعلانا قصيرا (مرة كل ساعة)\n"
+        "2 - شاهد اعلانا لمدة 30 ثانية (مرة كل ساعة)\n"
         "3 - اختر الجودة\n"
         "4 - استلم الملف"
     )
 
+# ─────────────────────────────────────────────
+# التشغيل
+# ─────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CallbackQueryHandler(handle_ad_callback, pattern="^ad_"))
+    app.add_handler(CallbackQueryHandler(handle_ad_open,     pattern="^ad_open$"))
+    app.add_handler(CallbackQueryHandler(handle_ad_callback, pattern="^ad_(done|too_early)$"))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern="^quality_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    print("البوت يعمل...")
+    print("البوت يعمل مع نظام الاعلانات الاجباري...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
